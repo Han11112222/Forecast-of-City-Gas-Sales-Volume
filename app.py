@@ -3,10 +3,11 @@
 # B) 판매량 예측(냉방용) : 전월16~당월15 평균기온 + Poly-3/4 비교
 # C) 공급량 추세분석     : 연도별 총합 OLS/CAGR/Holt/SES + ARIMA/SARIMA(12)
 # 업데이트 내역:
+#  - 신규 기온 스프레드시트 URL 기본값 적용
 #  - 실적/기온 데이터를 구글 시트 URL 기반으로 분리하여 자동 로드 및 병합(Merge)
-#  - '연', '년', '연도', '년도', '월', '기간', '기준일' 등 다양한 컬럼명 자동 탐지 및 연/월 추출 로직 강화 (KeyError 방지)
-#  - 병합 실패 시 앱 강제 종료(Crash)를 막고 에러 원인을 안내하는 Safety Check 추가
-#  - 차트 Y축 단위를 GJ(Gigajoules)로 수정
+#  - '일자', '연', '년', '연도', '년도', '기간' 등 다양한 컬럼명 자동 탐지 및 연/월 추출 로직 강화
+#  - Header 누락 방지: 첫 줄이 데이터로 시작할 경우 앱 크래시 대신 친절한 Warning 알림창 출력
+#  - 단위 표기 일괄 GJ(Gigajoules) 적용 고정
 
 import os
 from io import BytesIO
@@ -61,7 +62,7 @@ def title_with_icon(icon: str, text: str, level: str = "h1", small=False):
 # ───────────── 구글 스프레드시트 연동 유틸 ─────────────
 @st.cache_data(ttl=600)
 def read_google_sheet(url: str) -> pd.DataFrame:
-    """구글 스프레드시트 URL을 판다스 데이터프레임으로 변환"""
+    """구글 스프레드시트 URL을 판다스 데이터프레임으로 변환 및 헤더 누락 검사"""
     try:
         if "/edit" in url:
             base_url = url.split("/edit")[0]
@@ -72,7 +73,15 @@ def read_google_sheet(url: str) -> pd.DataFrame:
                 export_url = f"{base_url}/export?format=csv"
         else:
             export_url = url
+            
         df = pd.read_csv(export_url)
+        
+        if not df.empty:
+            # 스마트 헤더 누락 검사 (첫 번째 컬럼명이 숫자로만 이루어진 날짜 형태인지 확인)
+            first_col = str(df.columns[0]).replace('-', '').replace('.', '').replace('/', '')
+            if first_col.isdigit() and len(str(df.columns[0])) >= 4:
+                st.warning(f"⚠️ 스프레드시트의 첫 번째 줄이 제목이 아닌 데이터('{df.columns[0]}')로 인식되었습니다. 시트 1행에 '일자', '연도' 등의 제목(헤더)을 꼭 추가해주세요!")
+                
         return normalize_cols(df)
     except Exception as e:
         st.error(f"구글 스프레드시트를 읽어오는 중 오류가 발생했습니다: {e}")
@@ -117,7 +126,7 @@ TEMP_HINTS = ["평균기온", "기온", "temperature", "temp", "예상기온", "
 KNOWN_PRODUCT_ORDER = [
     "개별난방용", "중앙난방용",
     "자가열전용", "일반용(2)", "업무난방용", "냉난방용",
-    "주한미군", "취사용", "총공급량",
+    "주한미군", "취사용", "총공급량", "공급량(GJ)", "공급량"
 ]
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,7 +134,7 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     # 1. 컬럼명 앞뒤 공백 제거
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 2. 유연한 컬럼명 탐색 (KeyError 근본 원인 해결)
+    # 2. 유연한 컬럼명 탐색 (일자, 기준일 등 매핑)
     date_col = next((c for c in df.columns if c.lower() in ["날짜", "일자", "date", "기준일", "기간"]), None)
     y_col = next((c for c in df.columns if c.lower() in ["연", "년", "연도", "년도", "year"]), None)
     m_col = next((c for c in df.columns if c.lower() in ["월", "month"]), None)
@@ -144,12 +153,11 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
         if "월" not in df.columns:
             df["월"] = df["날짜"].dt.month
     elif "연" in df.columns and "월" in df.columns:
-        # 날짜 컬럼은 없지만 연, 월은 있을 때 강제로 날짜 생성
         df["날짜"] = pd.to_datetime(df["연"].astype(str) + "-" + df["월"].astype(str) + "-01", errors="coerce")
         
     # 5. 콤마 제거 및 숫자형 변환
     for c in df.columns:
-        if df[c].dtype == "object":
+        if df[c].dtype == "object" and c not in ["날짜", date_col]:
             df[c] = pd.to_numeric(
                 df[c].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False),
                 errors="ignore",
@@ -244,7 +252,6 @@ def render_centered_table(df: pd.DataFrame, float1_cols=None, int_cols=None, ind
             )
     st.markdown(show.to_html(index=index, classes="centered-table"), unsafe_allow_html=True)
 
-# 추천 학습기간 스코어 계산 유틸
 def _r2_for_range(df: pd.DataFrame, prod: str, temp_col: str, start_year: int, end_year: int | None = None):
     if end_year is None:
         end_year = int(df["연"].max())
@@ -295,7 +302,6 @@ def render_supply_forecast():
                     
                     # 1. 공급량 데이터에 기온이 없으면 기온 시트와 '연', '월' 기준으로 병합
                     if temp_col_df is None and temp_col_raw is not None:
-                        # Safety Check: Merge 전에 '연'과 '월' 컬럼이 무사히 생성되었는지 확인
                         if '연' not in df.columns or '월' not in df.columns:
                             st.error(f"🚨 공급량 시트에서 '연도'와 '월' 정보를 식별하지 못했습니다. (인식된 열: {list(df.columns)})")
                             st.stop()
@@ -322,10 +328,10 @@ def render_supply_forecast():
         else:
             up = st.file_uploader("📄 실적 엑셀 업로드(xlsx)", type=["xlsx"])
             if up is not None:
-                pass
+                df = read_excel_sheet(up, prefer_sheet="데이터")
             up_fc = st.file_uploader("🌡️ 예상기온 엑셀 업로드(xlsx)", type=["xlsx"])
             if up_fc is not None:
-                pass 
+                forecast_df = read_temperature_forecast(up_fc)
 
         if df is None or len(df) == 0:
             st.info("🧩 실적 데이터를 구글 시트 URL로 연결하거나 엑셀 파일을 업로드해 주세요."); st.stop()
