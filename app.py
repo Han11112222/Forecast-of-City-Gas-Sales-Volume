@@ -2,14 +2,11 @@
 # A) 공급량 예측        : Poly-3 기반 + Normal/Best/Conservative + 기온추세분석
 # B) 판매량 예측(냉방용) : 전월16~당월15 평균기온 + Poly-3/4 비교
 # C) 공급량 추세분석     : 연도별 총합 OLS/CAGR/Holt/SES + ARIMA/SARIMA(12)
-# Fix: ARIMA/SARIMA 공란 방지(월별 실패 시 '연도합'에 직접 ARIMA 폴백)
-# Default(추세분석 탭 상품): 개별난방용, 중앙난방용, 취사용
-# 업데이트: 
-#  - 실적(공급/판매) 데이터와 기온 데이터를 각각 다른 구글 시트에서 불러오도록 구조 분리 및 URL 매핑
-#  - 기온 열이 없을 시, 기온 시트에서 불러와 월별 평균으로 자동 집계 후 병합(Merge)하는 로직 추가
-#  - 추천 학습기간 하이라이트: 시작~종료 전체(rect) 채우기
-#  - 추천 R² 표기 소수 4자리
-#  - Plotly 그래프 scrollZoom=True 적용
+# 업데이트 내역:
+#  - 실적/기온 데이터를 구글 시트 URL 기반으로 분리하여 자동 로드 및 병합(Merge)
+#  - '연', '년', '연도', '년도', '월', '기간', '기준일' 등 다양한 컬럼명 자동 탐지 및 연/월 추출 로직 강화 (KeyError 방지)
+#  - 병합 실패 시 앱 강제 종료(Crash)를 막고 에러 원인을 안내하는 Safety Check 추가
+#  - 차트 Y축 단위를 GJ(Gigajoules)로 수정
 
 import os
 from io import BytesIO
@@ -125,27 +122,32 @@ KNOWN_PRODUCT_ORDER = [
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # 1. 컬럼명 앞뒤 공백 제거
     df.columns = [str(c).strip() for c in df.columns]
-    if "날짜" in df.columns:
-        df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
-    elif "일자" in df.columns:
-        df["날짜"] = pd.to_datetime(df["일자"], errors="coerce")
-    elif "date" in df.columns:
-        df["날짜"] = pd.to_datetime(df["date"], errors="coerce")
-    else:
-        if ("연" in df.columns or "년" in df.columns) and "월" in df.columns:
-            y = df["연"] if "연" in df.columns else df["년"]
-            df["날짜"] = pd.to_datetime(y.astype(str) + "-" + df["월"].astype(str) + "-01", errors="coerce")
-    
-    if "연" not in df.columns:
-        if "년" in df.columns:
-            df["연"] = df["년"]
-        elif "날짜" in df.columns:
+
+    # 2. 유연한 컬럼명 탐색 (KeyError 근본 원인 해결)
+    date_col = next((c for c in df.columns if c.lower() in ["날짜", "일자", "date", "기준일", "기간"]), None)
+    y_col = next((c for c in df.columns if c.lower() in ["연", "년", "연도", "년도", "year"]), None)
+    m_col = next((c for c in df.columns if c.lower() in ["월", "month"]), None)
+
+    # 3. 발견된 연/월 컬럼을 표준 '연', '월' 이름으로 복제
+    if y_col and "연" not in df.columns:
+        df["연"] = df[y_col]
+    if m_col and "월" not in df.columns:
+        df["월"] = df[m_col]
+
+    # 4. 날짜 파싱 및 연월 결측치 보완
+    if date_col:
+        df["날짜"] = pd.to_datetime(df[date_col], errors="coerce")
+        if "연" not in df.columns:
             df["연"] = df["날짜"].dt.year
-            
-    if "월" not in df.columns and "날짜" in df.columns:
-        df["월"] = df["날짜"].dt.month
+        if "월" not in df.columns:
+            df["월"] = df["날짜"].dt.month
+    elif "연" in df.columns and "월" in df.columns:
+        # 날짜 컬럼은 없지만 연, 월은 있을 때 강제로 날짜 생성
+        df["날짜"] = pd.to_datetime(df["연"].astype(str) + "-" + df["월"].astype(str) + "-01", errors="coerce")
         
+    # 5. 콤마 제거 및 숫자형 변환
     for c in df.columns:
         if df[c].dtype == "object":
             df[c] = pd.to_numeric(
@@ -288,25 +290,28 @@ def render_supply_forecast():
                     raw_temp_df = read_google_sheet(temp_url)
                     
                 if df is not None and not df.empty and raw_temp_df is not None and not raw_temp_df.empty:
-                    # 데이터 내에 기온 열이 존재하는지 각각 확인
                     temp_col_df = detect_temp_col(df)
                     temp_col_raw = detect_temp_col(raw_temp_df)
                     
-                    # 1. 공급량 데이터에 기온이 없으면 기온 시트와 '연', '월' 기준으로 자동 병합(Merge)
+                    # 1. 공급량 데이터에 기온이 없으면 기온 시트와 '연', '월' 기준으로 병합
                     if temp_col_df is None and temp_col_raw is not None:
-                        # 일별 데이터일 가능성을 대비해 월별 평균으로 그룹화 집계
+                        # Safety Check: Merge 전에 '연'과 '월' 컬럼이 무사히 생성되었는지 확인
+                        if '연' not in df.columns or '월' not in df.columns:
+                            st.error(f"🚨 공급량 시트에서 '연도'와 '월' 정보를 식별하지 못했습니다. (인식된 열: {list(df.columns)})")
+                            st.stop()
+                        if '연' not in raw_temp_df.columns or '월' not in raw_temp_df.columns:
+                            st.error(f"🚨 기온 시트에서 '연도'와 '월' 정보를 식별하지 못했습니다. (인식된 열: {list(raw_temp_df.columns)})")
+                            st.stop()
+                            
                         monthly_temp = raw_temp_df.groupby(['연', '월'])[temp_col_raw].mean().reset_index()
                         df = df.merge(monthly_temp, on=['연', '월'], how='left')
-                        # 병합 후 기온 열 이름을 다시 찾아줌
                         temp_col_df = temp_col_raw 
                     
-                    # 2. forecast_df (미래 예상기온 데이터셋) 구성
+                    # 2. forecast_df (미래 예측기온) 구성
                     if temp_col_raw is not None:
-                        # 월별 평균 집계 후 예측용 데이터프레임 생성
                         forecast_df = raw_temp_df.groupby(['연', '월'])[temp_col_raw].mean().reset_index()
                         forecast_df.rename(columns={temp_col_raw: "예상기온"}, inplace=True)
                         
-                        # 추세기온 열이 존재하면 같이 병합
                         trend_cols = [c for c in raw_temp_df.columns if any(k in str(c) for k in ["추세분석", "추세기온"])]
                         if trend_cols:
                             trend_monthly = raw_temp_df.groupby(['연', '월'])[trend_cols[0]].mean().reset_index()
@@ -314,12 +319,10 @@ def render_supply_forecast():
                             forecast_df.rename(columns={trend_cols[0]: "추세기온"}, inplace=True)
                         else:
                             forecast_df["추세기온"] = forecast_df["예상기온"]
-
         else:
             up = st.file_uploader("📄 실적 엑셀 업로드(xlsx)", type=["xlsx"])
             if up is not None:
-                # read_excel_sheet 함수는 원본 코드에 있던 파일 리딩 함수 가정
-                pass # 수동 파일 업로드 로직은 기존 유지
+                pass
             up_fc = st.file_uploader("🌡️ 예상기온 엑셀 업로드(xlsx)", type=["xlsx"])
             if up_fc is not None:
                 pass 
@@ -327,7 +330,6 @@ def render_supply_forecast():
         if df is None or len(df) == 0:
             st.info("🧩 실적 데이터를 구글 시트 URL로 연결하거나 엑셀 파일을 업로드해 주세요."); st.stop()
 
-        # 최후의 확인: 병합이 끝난 뒤에도 기온 열을 못 찾으면 에러 발생
         temp_col = detect_temp_col(df)
         if temp_col is None:
             st.error("🌡️ 데이터 내에서 기온 관련 열(평균기온/기온)을 식별할 수 없습니다. 시트의 컬럼명을 확인해주세요."); st.stop()
@@ -525,7 +527,11 @@ def render_supply_forecast():
                 p_idx = fut_base["연"] == int(y)
                 fig.add_trace(go.Scatter(x=[f"{int(m)}월" for m in fut_base[p_idx]["월"]], y=np.clip(np.rint(y_norm[p_idx]), 0, None), mode="lines", name=f"{y} 예측(Normal)", line=dict(dash="dash")))
             
-            fig.update_layout(title=f"📊 {prod} 공급량 추이 분석 (Train R²={r2_train:.4f})", dragmode="pan")
+            fig.update_layout(
+                title=f"📊 {prod} 공급량 추이 분석 (Train R²={r2_train:.4f})", 
+                dragmode="pan",
+                yaxis=dict(title="공급량 (GJ)", rangemode="tozero")
+            )
             st.plotly_chart(fig, use_container_width=True, config=dict(scrollZoom=True, displaylogo=False))
 
 
@@ -551,8 +557,10 @@ def render_cooling_sales_forecast():
                     temp_col_sales = detect_temp_col(sales_df)
                     temp_col_raw = detect_temp_col(raw_temp_df)
                     
-                    # 판매량 데이터에 자체 기온이 없으면 기온 시트와 병합
                     if temp_col_sales is None and temp_col_raw is not None:
+                        if '연' not in sales_df.columns or '월' not in sales_df.columns:
+                            st.error(f"🚨 판매량 시트에서 '연도'와 '월' 정보를 찾을 수 없습니다. (인식된 열: {list(sales_df.columns)})")
+                            st.stop()
                         monthly_temp = raw_temp_df.groupby(['연', '월'])[temp_col_raw].mean().reset_index()
                         sales_df = sales_df.merge(monthly_temp, on=['연', '월'], how='left')
 
@@ -566,7 +574,6 @@ def render_cooling_sales_forecast():
     product_cols = guess_product_cols(sales_df)
     sel_prod = st.selectbox("📦 분석 및 예측 대상 상품 선택", product_cols)
 
-    # Poly-3 및 Poly-4 차수 비교 연산 로직 자동 수행
     st.markdown(f"### ⚙️ {sel_prod} 차수별 적합도 비교 (Poly-3 vs Poly-4)")
     x_data = sales_df[temp_col].astype(float).values
     y_data = sales_df[sel_prod].astype(float).values
@@ -578,12 +585,11 @@ def render_cooling_sales_forecast():
         c_a, c_b = st.columns(2)
         with c_a:
             st.metric("3차 다항식 결정계수 (Poly-3 R²)", f"{r2_p3:.4f}")
-            st.caption(f"방정식식: {poly_eq_text(model_p3)}")
+            st.caption(f"방정식: {poly_eq_text(model_p3)}")
         with c_b:
             st.metric("4차 다항식 결정계수 (Poly-4 R²)", f"{r2_p4:.4f}")
             st.caption(f"방정식: {poly_eq_text4(model_p4)}")
             
-        # 데이터 분포 산점도 시각화
         fig_cool, ax_cool = plt.subplots(figsize=(10, 4))
         ax_cool.scatter(x_data, y_data, alpha=0.5, label="실적 실시간 샘플")
         x_domain = np.linspace(x_data.min()-1, x_data.max()+1, 100)
