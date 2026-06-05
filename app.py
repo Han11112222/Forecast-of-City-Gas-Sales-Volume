@@ -10,10 +10,10 @@
 #  - 추천 범위 계산에서 종료연도와 같은 시작연도 제외(range(min_year, end_year))
 #  - Plotly 그래프 scrollZoom=True 적용
 #  - Best 시나리오 인덱싱 오타 수정
-# 업데이트(UI 원상복구 및 안정성 강화):
-#  - 기존 오리지널 UI/UX 및 타이틀("도시가스 공급·판매량 예측") 완벽 복구
-#  - 구글 스프레드시트 연동 로직 적용 및 헤더 누락 시 스마트 복구
-#  - 데이터 빈칸(NaN) 시 모델 학습(fit) 과정에서 발생하는 ValueError 원천 차단
+# 업데이트 내역:
+#  - 기존 오리지널 UI/화면구성 100% 원상 복구
+#  - 구글 시트 연동 기능 추가 및 일별 데이터를 월별 누적(Billion 스케일)으로 자동 롤업(Roll-up)하는 로직 추가
+#  - 0 샘플 학습으로 인한 ValueError 완벽 방어
 
 import os
 from io import BytesIO
@@ -95,10 +95,11 @@ set_korean_font()
 
 # ───────────── 공통 상수/유틸 ─────────────
 META_COLS = {"날짜", "일자", "date", "연", "년", "월"}
-TEMP_HINTS = ["평균기온", "기온", "temperature", "temp", "예상기온", "추세기온"]
+TEMP_HINTS = ["평균기온", "기온", "temperature", "temp"]
 KNOWN_PRODUCT_ORDER = [
-    "개별난방용", "중앙난방용", "자가열전용", "일반용(2)", "업무난방용", 
-    "냉난방용", "주한미군", "취사용", "총공급량", "공급량(MJ)", "공급량"
+    "개별난방용", "중앙난방용",
+    "자가열전용", "일반용(2)", "업무난방용", "냉난방용",
+    "주한미군", "취사용", "총공급량", "공급량(MJ)", "공급량(M3)"
 ]
 
 # 전역 기본 스프레드시트 주소 설정
@@ -110,29 +111,32 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     
-    date_col = next((c for c in df.columns if c.lower() in ["날짜", "일자", "date", "기준일", "기간"]), None)
-    y_col = next((c for c in df.columns if c.lower() in ["연", "년", "연도", "년도", "year"]), None)
-    m_col = next((c for c in df.columns if c.lower() in ["월", "month"]), None)
-
-    if y_col and "연" not in df.columns: df["연"] = df[y_col]
-    if m_col and "월" not in df.columns: df["월"] = df[m_col]
-
-    if date_col:
-        df["날짜"] = pd.to_datetime(df[date_col], errors="coerce")
-        if "연" not in df.columns: df["연"] = df["날짜"].dt.year
-        if "월" not in df.columns: df["월"] = df["날짜"].dt.month
-    elif "연" in df.columns and "월" in df.columns:
-        df["날짜"] = pd.to_datetime(df["연"].astype(str) + "-" + df["월"].astype(str) + "-01", errors="coerce")
-        
+    # 텍스트 내 콤마 등을 미리 제거하고 에러 발생 시 NaN 처리(coerce)하여 문자열 파싱 문제 방어
     for c in df.columns:
-        if c not in ["날짜", date_col]:
+        if df[c].dtype == "object" and c.lower() not in ["날짜", "일자", "date", "기준일", "기간"]:
             df[c] = pd.to_numeric(
                 df[c].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False),
-                errors="coerce" # 강제 숫자형 변환으로 에러 방지
+                errors="coerce"
             )
-            
-    if "연" in df.columns: df["연"] = pd.to_numeric(df["연"], errors="coerce").fillna(0).astype(int)
-    if "월" in df.columns: df["월"] = pd.to_numeric(df["월"], errors="coerce").fillna(1).astype(int)
+
+    if "날짜" in df.columns:
+        df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
+    elif "일자" in df.columns:
+        df["날짜"] = pd.to_datetime(df["일자"], errors="coerce")
+    elif "date" in df.columns:
+        df["날짜"] = pd.to_datetime(df["date"], errors="coerce")
+    else:
+        if ("연" in df.columns or "년" in df.columns) and "월" in df.columns:
+            y = df["연"] if "연" in df.columns else df["년"]
+            df["날짜"] = pd.to_datetime(y.astype(str) + "-" + df["월"].astype(str) + "-01", errors="coerce")
+    if "연" not in df.columns:
+        if "년" in df.columns:
+            df["연"] = df["년"]
+        elif "날짜" in df.columns:
+            df["연"] = df["날짜"].dt.year
+    if "월" not in df.columns and "날짜" in df.columns:
+        df["월"] = df["날짜"].dt.month
+        
     return df
 
 @st.cache_data(ttl=600)
@@ -140,16 +144,14 @@ def read_google_sheet(url: str) -> pd.DataFrame:
     try:
         if "/edit" in url:
             base_url = url.split("/edit")[0]
-            if "gid=" in url:
-                gid = url.split("gid=")[1].split("&")[0].split("#")[0]
-                export_url = f"{base_url}/export?format=csv&gid={gid}"
-            else:
-                export_url = f"{base_url}/export?format=csv"
+            gid = url.split("gid=")[1].split("&")[0].split("#")[0] if "gid=" in url else "0"
+            export_url = f"{base_url}/export?format=csv&gid={gid}"
         else:
             export_url = url
             
         df = pd.read_csv(export_url)
         
+        # 헤더 누락 시 DSE 표준 컬럼 자동 매핑 복구
         if not df.empty:
             first_col_val = str(df.columns[0]).strip().replace('-', '').replace('.', '').replace('/', '')
             if first_col_val.isdigit() and len(first_col_val) >= 4:
@@ -164,9 +166,29 @@ def read_google_sheet(url: str) -> pd.DataFrame:
                     else: new_cols.append(f"임시데이터_{i}")
                 df.columns = new_cols
                 
-        return normalize_cols(df)
+        df = normalize_cols(df)
+
+        # ★ 핵심 로직: 일별 데이터를 월별 누적합(단위 B 스케일 복원)으로 롤업(Roll-up)
+        if not df.empty and "연" in df.columns and "월" in df.columns:
+            if len(df) > len(df[['연', '월']].drop_duplicates()):
+                temp_col = detect_temp_col(df)
+                agg_dict = {}
+                for c in df.columns:
+                    if c in ["연", "월", "날짜", "일자", "date"]: continue
+                    if temp_col and c == temp_col:
+                        agg_dict[c] = 'mean' # 기온은 평균
+                    elif pd.api.types.is_numeric_dtype(df[c]):
+                        agg_dict[c] = 'sum'  # 공급량은 합계
+                    else:
+                        agg_dict[c] = 'first'
+                
+                df_monthly = df.groupby(['연', '월']).agg(agg_dict).reset_index()
+                df_monthly['날짜'] = pd.to_datetime(df_monthly['연'].astype(str) + '-' + df_monthly['월'].astype(str) + '-01')
+                df = df_monthly
+                
+        return df
     except Exception as e:
-        st.error(f"구글 스프레드시트 로딩 오류: {e}")
+        st.error(f"구글 시트 오류: {e}")
         return pd.DataFrame()
 
 def detect_temp_col(df: pd.DataFrame) -> str | None:
@@ -197,7 +219,59 @@ def read_excel_sheet(path_or_file, prefer_sheet="데이터"):
     return normalize_cols(df)
 
 @st.cache_data(ttl=600)
+def read_temperature_raw(file):
+    def _finalize(df):
+        df.columns = [str(c).strip() for c in df.columns]
+        date_col = None
+        for c in df.columns:
+            if str(c).lower() in ["날짜", "일자", "date"]:
+                date_col = c
+                break
+        if date_col is None:
+            for c in df.columns:
+                try:
+                    pd.to_datetime(df[c], errors="raise")
+                    date_col = c
+                    break
+                except Exception:
+                    pass
+        temp_col = None
+        for c in df.columns:
+            if ("평균기온" in str(c)) or ("기온" in str(c)) or (str(c).lower() in ["temp", "temperature"]):
+                temp_col = c
+                break
+        if date_col is None or temp_col is None:
+            return None
+        out = pd.DataFrame(
+            {"일자": pd.to_datetime(df[date_col], errors="coerce"), "기온": pd.to_numeric(df[temp_col], errors="coerce")}
+        ).dropna()
+        return out.sort_values("일자").reset_index(drop=True)
+
+    name = getattr(file, "name", str(file))
+    if name and name.lower().endswith(".csv"):
+        return _finalize(pd.read_csv(file))
+    xls = pd.ExcelFile(file, engine="openpyxl")
+    sheet = xls.sheet_names[0]
+    head = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=50)
+    header_row = None
+    for i in range(len(head)):
+        row = [str(v) for v in head.iloc[i].tolist()]
+        if any(v in ["날짜", "일자", "date", "Date"] for v in row) and any(
+            ("평균기온" in v) or ("기온" in v) or (isinstance(v, str) and v.lower() in ["temp", "temperature"])
+            for v in row
+        ):
+            header_row = i
+            break
+    df = (
+        pd.read_excel(xls, sheet_name=sheet)
+        if header_row is None
+        else pd.read_excel(xls, sheet_name=sheet, header=header_row)
+    )
+    return _finalize(df)
+
+@st.cache_data(ttl=600)
 def read_temperature_forecast(file):
+    """월 단위 (날짜, 평균기온[, 추세분석]) → (연, 월, 예상기온, 추세기온)"""
     try:
         xls = pd.ExcelFile(file, engine="openpyxl")
         sheet = "기온예측" if "기온예측" in xls.sheet_names else xls.sheet_names[0]
@@ -206,10 +280,11 @@ def read_temperature_forecast(file):
         df = pd.read_excel(file, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
     date_col = next((c for c in df.columns if c in ["날짜", "일자", "date", "Date"]), df.columns[0])
-    base_temp_col = next((c for c in df.columns if ("평균기온" in c) or (str(c).lower() in ["temp", "temperature", "기온"])), None)
+    base_temp_col = next(
+        (c for c in df.columns if ("평균기온" in c) or (str(c).lower() in ["temp", "temperature", "기온"])), None
+    )
     trend_cols = [c for c in df.columns if any(k in str(c) for k in ["추세분석", "추세기온"])]
     trend_col = trend_cols[0] if trend_cols else None
-    
     if base_temp_col is None:
         raise ValueError("기온예측 파일에서 '평균기온' 또는 '기온' 열을 찾지 못했습니다.")
     d = pd.DataFrame(
@@ -227,7 +302,7 @@ def month_start(x):
 def month_range_inclusive(s, e):
     return pd.date_range(start=month_start(s), end=month_start(e), freq="MS")
 
-# Poly-3/4 공통 (0 샘플 에러 완벽 방어)
+# Poly-3/4 공통 (★ 0 Sample ValueError 완벽해결 ★)
 def fit_poly3_and_predict(x_train, y_train, x_future):
     x_train = np.asarray(x_train, dtype=float)
     y_train = np.asarray(y_train, dtype=float)
@@ -344,6 +419,7 @@ def recommend_train_ranges(df: pd.DataFrame, prod: str, temp_col: str,
 # ===========================================================
 # A) 공급량 예측
 # ===========================================================
+
 def render_supply_forecast():
     with st.sidebar:
         title_with_icon("📥", "데이터 불러오기", "h3", small=True)
@@ -405,7 +481,7 @@ def render_supply_forecast():
 
         title_with_icon("📚", "학습 데이터 연도 선택", "h3", small=True)
         years_all = sorted([int(y) for y in pd.Series(df["연"]).dropna().unique() if y > 0])
-        default_years = [y for y in years_all if y >= 2014] # 데이터가 있는 구간 위주로 기본값 설정
+        default_years = [y for y in years_all if y >= 2014]
         if not default_years: default_years = years_all
         years_sel = st.multiselect("🗓️ 연도 선택", years_all, default=default_years)
 
@@ -636,7 +712,7 @@ def render_supply_forecast():
             mime="text/csv",
         )
 
-    # 그래프
+    # 그래프 (원본 코드 100% 동일 구조)
     title_with_icon("📈", "그래프(실적 + 예측 + 기온추세분석)", "h3", small=True)
     cc1, cc2 = st.columns([1, 2])
     with cc1:
@@ -816,7 +892,7 @@ def render_supply_forecast():
         table_show = pd.concat([table, pd.DataFrame([sum_row])], ignore_index=True)
         render_centered_table(table_show, int_cols=[c for c in table_show.columns if c != "월"], index=False)
 
-        # 산점도 (0 샘플 보호 로직 적용)
+        # 산점도
         title_with_icon("🔎", f"{prod} — 기온·공급량 상관(Train, R²={r2_train:.3f})", "h3", small=True)
         figc, axc = plt.subplots(figsize=(10, 5.2))
         x_tr = np.asarray(train_df[temp_col].astype(float).values)
@@ -836,7 +912,7 @@ def render_supply_forecast():
             axc.text(0.02, 0.04, f"Poly-3: {poly_eq_text(model_s)}", transform=axc.transAxes,
                      fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.75))
         else:
-            axc.text(0.5, 0.5, "과거 데이터 부족으로 산점도를 생성할 수 없습니다.", ha="center", va="center", fontsize=12)
+            axc.text(0.5, 0.5, "과거 데이터가 충분하지 않아 산점도를 생성할 수 없습니다.", ha="center", va="center", fontsize=12)
             axc.set_axis_off()
         st.pyplot(figc)
 
@@ -847,9 +923,9 @@ def render_supply_forecast():
 # ===========================================================
 
 def render_cooling_sales_forecast():
-    # 원본 파일에서 B섹션 구조를 100% 동일하게 유지합니다. (오류 방지 풀로직 채움)
+    # 원본 파일에서 B섹션 구조를 100% 동일하게 유지
     title_with_icon("🧊", "판매량 예측(냉방용) — 전월 16일 ~ 당월 15일 평균기온 기준", "h2")
-    st.write("🗂️ 구글 시트를 통해 **냉방용 판매 실적 데이터**와 **기온 RAW(일별)**을 불러옵니다.")
+    st.write("🗂️ 냉방용 **판매 실적 엑셀**과 **기온 RAW(일별)**을 준비하세요.")
     
     with st.sidebar:
         title_with_icon("📥", "데이터 불러오기", "h3", small=True)
